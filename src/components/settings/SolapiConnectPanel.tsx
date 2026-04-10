@@ -1,206 +1,220 @@
 'use client'
 
-import { useState, useEffect } from 'react'
-import { useRouter } from 'next/navigation'
+import { useState, useEffect, useCallback } from 'react'
 import { createClient } from '@/lib/supabase/client'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
-import { ExternalLink, Coins, Phone, MessageCircle, FileText, CheckCircle2, AlertCircle } from 'lucide-react'
-
-const MYSITE_URL = process.env.NEXT_PUBLIC_SOLAPI_MYSITE_URL ?? 'https://pixelpage.solapi.com'
+import { ExternalLink, Coins, Phone, MessageCircle, FileText, CheckCircle2, AlertCircle, Loader2, Link2 } from 'lucide-react'
 
 interface SolapiConnectPanelProps {
   workspaceId: string
 }
 
-export default function SolapiConnectPanel({ workspaceId }: SolapiConnectPanelProps) {
-  const router = useRouter()
-  const [apiKey, setApiKey] = useState('')
-  const [apiSecret, setApiSecret] = useState('')
-  const [saving, setSaving] = useState(false)
-  const [saved, setSaved] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const [hasKeys, setHasKeys] = useState(false)
+type ConnectionStatus = 'loading' | 'connected' | 'disconnected'
 
-  // 기존 설정 로드
-  useEffect(() => {
+const PAGE_LINKS = [
+  { key: '충전', icon: Coins, label: '충전하기', color: 'text-primary', bg: 'bg-primary/10' },
+  { key: '발신번호', icon: Phone, label: '발신번호 등록', color: 'text-blue-500', bg: 'bg-blue-50' },
+  { key: '카카오채널', icon: MessageCircle, label: '카카오 채널 연동', color: 'text-yellow-600', bg: 'bg-yellow-50' },
+  { key: '알림톡템플릿', icon: FileText, label: '알림톡 템플릿', color: 'text-amber-600', bg: 'bg-amber-50' },
+] as const
+
+export default function SolapiConnectPanel({ workspaceId }: SolapiConnectPanelProps) {
+  const [status, setStatus] = useState<ConnectionStatus>('loading')
+  const [connecting, setConnecting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [openingPage, setOpeningPage] = useState<string | null>(null)
+  const [senderPhone, setSenderPhone] = useState('')
+  const [savingPhone, setSavingPhone] = useState(false)
+  const [phoneSaved, setPhoneSaved] = useState(false)
+
+  const checkConnection = useCallback(async () => {
     const supabase = createClient()
-    supabase
+    const { data } = await supabase
       .from('workspace_integrations')
       .select('config')
       .eq('workspace_id', workspaceId)
-      .eq('provider', 'solapi')
+      .eq('provider', 'solapi_sso')
       .single()
-      .then(({ data }) => {
-        const config = data?.config as any
-        if (config?.api_key) {
-          setApiKey(config.api_key)
-          setApiSecret(config.api_secret ?? '')
-          setHasKeys(true)
-        }
-      })
+
+    const config = data?.config as any
+    if (config?.account_id) {
+      setStatus('connected')
+      setSenderPhone(config.sender_phone ?? '')
+    } else {
+      setStatus('disconnected')
+    }
   }, [workspaceId])
 
-  const handleSave = async () => {
-    if (!apiKey.trim() || !apiSecret.trim()) return
-    setSaving(true)
+  useEffect(() => {
+    checkConnection()
+  }, [checkConnection])
+
+  const handleConnect = async () => {
+    setConnecting(true)
     setError(null)
-    setSaved(false)
-
-    // API 키 유효성 테스트
     try {
-      const res = await fetch(`${MYSITE_URL}/api/cash/v1/balance`, {
-        headers: {
-          Authorization: await buildHmacAuth(apiKey.trim(), apiSecret.trim()),
-        },
+      const res = await fetch('/api/solapi/sso', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workspaceId }),
       })
-      if (!res.ok) {
-        setError('API 키가 유효하지 않습니다. 마이사이트의 API 키를 확인해 주세요.')
-        setSaving(false)
-        return
-      }
-    } catch {
-      setError('연결에 실패했습니다.')
-      setSaving(false)
-      return
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error ?? '연동에 실패했습니다.')
+      setStatus('connected')
+    } catch (e: any) {
+      setError(e.message)
+    } finally {
+      setConnecting(false)
     }
-
-    const supabase = createClient()
-    await supabase.from('workspace_integrations').upsert({
-      workspace_id: workspaceId,
-      provider: 'solapi',
-      config: { api_key: apiKey.trim(), api_secret: apiSecret.trim() } as any,
-      updated_at: new Date().toISOString(),
-    }, { onConflict: 'workspace_id,provider' })
-
-    setSaving(false)
-    setSaved(true)
-    setHasKeys(true)
-    router.refresh()
   }
 
-  const mysiteLinks = [
-    { icon: Coins, label: '충전하기', path: '/dashboard', color: 'text-primary', bg: 'bg-primary/10' },
-    { icon: Phone, label: '발신번호 등록', path: '/senderids', color: 'text-blue-500', bg: 'bg-blue-50' },
-    { icon: MessageCircle, label: '카카오 채널 연동', path: '/kakao/channel', color: 'text-yellow-600', bg: 'bg-yellow-50' },
-    { icon: FileText, label: '알림톡 템플릿', path: '/kakao/template', color: 'text-amber-600', bg: 'bg-amber-50' },
-  ]
+  const handleSavePhone = async () => {
+    if (!senderPhone.trim()) return
+    setSavingPhone(true)
+    setPhoneSaved(false)
+    const supabase = createClient()
+    const { data } = await supabase
+      .from('workspace_integrations')
+      .select('config')
+      .eq('workspace_id', workspaceId)
+      .eq('provider', 'solapi_sso')
+      .single()
+    const config = (data?.config as any) ?? {}
+    await supabase.from('workspace_integrations').upsert({
+      workspace_id: workspaceId,
+      provider: 'solapi_sso',
+      config: { ...config, sender_phone: senderPhone.trim() } as any,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'workspace_id,provider' })
+    setSavingPhone(false)
+    setPhoneSaved(true)
+  }
+
+  const handleOpenPage = async (pageKey: string) => {
+    setOpeningPage(pageKey)
+    setError(null)
+    try {
+      const res = await fetch('/api/solapi/page-url', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workspaceId, page: pageKey }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error ?? '페이지를 열 수 없습니다.')
+      window.open(data.url, '_blank', 'noopener,noreferrer')
+    } catch (e: any) {
+      setError(e.message)
+    } finally {
+      setOpeningPage(null)
+    }
+  }
+
+  if (status === 'loading') {
+    return (
+      <div className="flex items-center justify-center py-8">
+        <Loader2 className="w-5 h-5 animate-spin text-gray-400" />
+      </div>
+    )
+  }
 
   return (
     <div className="space-y-5">
-      {/* 1단계: 마이사이트 가입 */}
-      <div className="space-y-2">
-        <h4 className="text-[13px] font-semibold text-gray-700">1. 발송 서비스 가입</h4>
-        <a
-          href={MYSITE_URL}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="flex items-center justify-between p-3 rounded-lg border border-gray-200 hover:border-primary/30 hover:bg-primary/5 transition-colors"
-        >
-          <div>
-            <p className="text-[14px] font-semibold text-gray-900">발송 서비스 바로가기</p>
-            <p className="text-[12px] text-gray-400 mt-0.5">회원가입 후 충전, 발신번호, 카카오 채널을 설정하세요.</p>
-          </div>
-          <ExternalLink className="w-4 h-4 text-gray-400 shrink-0" />
-        </a>
-      </div>
-
-      {/* 2단계: API 키 입력 */}
-      <div className="space-y-2">
-        <h4 className="text-[13px] font-semibold text-gray-700">2. API 키 연동</h4>
-        <p className="text-[12px] text-gray-400">
-          발송 서비스에서 설정 → API Key 메뉴에서 키를 복사하여 입력하세요.
-        </p>
-
-        <div className="space-y-2">
-          <div className="space-y-1">
-            <Label className="text-[12px] font-semibold text-gray-500">API Key</Label>
-            <Input
-              placeholder="NCS..."
-              value={apiKey}
-              onChange={(e) => { setApiKey(e.target.value); setSaved(false) }}
-              className="h-9 rounded-lg border-gray-200 text-[13px] font-mono"
-            />
-          </div>
-          <div className="space-y-1">
-            <Label className="text-[12px] font-semibold text-gray-500">API Secret</Label>
-            <Input
-              type="password"
-              placeholder="API Secret"
-              value={apiSecret}
-              onChange={(e) => { setApiSecret(e.target.value); setSaved(false) }}
-              className="h-9 rounded-lg border-gray-200 text-[13px] font-mono"
-            />
-          </div>
+      {error && (
+        <div className="flex items-center gap-2 bg-red-50 rounded-lg px-3 py-2">
+          <AlertCircle className="w-3.5 h-3.5 text-red-500 shrink-0" />
+          <p className="text-[12px] text-red-600">{error}</p>
         </div>
+      )}
 
-        {error && (
-          <div className="flex items-center gap-2 bg-red-50 rounded-lg px-3 py-2">
-            <AlertCircle className="w-3.5 h-3.5 text-red-500 shrink-0" />
-            <p className="text-[12px] text-red-600">{error}</p>
+      {status === 'disconnected' ? (
+        /* 미연동 상태 */
+        <div className="space-y-3">
+          <div className="flex items-start gap-3 p-4 rounded-xl bg-gray-50 border border-gray-100">
+            <Link2 className="w-4 h-4 text-gray-400 mt-0.5 shrink-0" />
+            <div>
+              <p className="text-[13px] font-medium text-gray-700">발송 서비스 연동 필요</p>
+              <p className="text-[12px] text-gray-400 mt-0.5">
+                연동하면 충전, 발신번호 등록, 카카오 채널 설정을 이 서비스에서 바로 이용할 수 있습니다.
+              </p>
+            </div>
           </div>
-        )}
-
-        {saved && (
-          <div className="flex items-center gap-2 bg-green-50 rounded-lg px-3 py-2">
-            <CheckCircle2 className="w-3.5 h-3.5 text-green-500 shrink-0" />
-            <p className="text-[12px] text-green-600">연동되었습니다.</p>
+          <Button
+            onClick={handleConnect}
+            disabled={connecting}
+            className="w-full h-10 rounded-xl text-[13px] font-semibold bg-primary hover:bg-primary/90"
+          >
+            {connecting ? (
+              <>
+                <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                연동 중...
+              </>
+            ) : (
+              '발송 서비스 연동하기'
+            )}
+          </Button>
+        </div>
+      ) : (
+        /* 연동 완료 상태 */
+        <div className="space-y-3">
+          <div className="flex items-center gap-2 bg-green-50 rounded-lg px-3 py-2.5">
+            <CheckCircle2 className="w-4 h-4 text-green-500 shrink-0" />
+            <p className="text-[13px] font-medium text-green-700">발송 서비스가 연동되어 있습니다.</p>
           </div>
-        )}
 
-        <Button
-          onClick={handleSave}
-          disabled={!apiKey.trim() || !apiSecret.trim() || saving}
-          className="w-full h-9 rounded-lg text-[13px] font-semibold bg-primary hover:bg-primary/90"
-        >
-          {saving ? '확인 중...' : hasKeys ? 'API 키 업데이트' : 'API 키 저장'}
-        </Button>
-      </div>
-
-      {/* 3단계: 바로가기 */}
-      {hasKeys && (
-        <div className="space-y-2">
-          <h4 className="text-[13px] font-semibold text-gray-700">3. 발송 설정</h4>
           <div className="grid grid-cols-2 gap-2">
-            {mysiteLinks.map((link) => (
-              <a
-                key={link.path}
-                href={`${MYSITE_URL}${link.path}`}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="flex items-center gap-2.5 p-3 rounded-lg border border-gray-100 hover:border-gray-200 hover:bg-gray-50/50 transition-colors"
+            {PAGE_LINKS.map((link) => (
+              <button
+                key={link.key}
+                type="button"
+                disabled={openingPage === link.key}
+                onClick={() => handleOpenPage(link.key)}
+                className="flex items-center gap-2.5 p-3 rounded-lg border border-gray-100 hover:border-gray-200 hover:bg-gray-50/50 transition-colors disabled:opacity-60 disabled:cursor-not-allowed text-left"
               >
                 <div className={`w-8 h-8 rounded-lg ${link.bg} flex items-center justify-center shrink-0`}>
-                  <link.icon className={`w-4 h-4 ${link.color}`} />
+                  {openingPage === link.key ? (
+                    <Loader2 className={`w-4 h-4 ${link.color} animate-spin`} />
+                  ) : (
+                    <link.icon className={`w-4 h-4 ${link.color}`} />
+                  )}
                 </div>
                 <span className="text-[13px] font-medium text-gray-700">{link.label}</span>
-              </a>
+                <ExternalLink className="w-3 h-3 text-gray-300 ml-auto" />
+              </button>
             ))}
           </div>
+
+          {/* 발신번호 설정 */}
+          <div className="pt-2 border-t border-gray-100 space-y-2">
+            <p className="text-[12px] font-semibold text-gray-600">발신번호</p>
+            <p className="text-[11px] text-gray-400">마이사이트에서 등록한 발신번호를 입력하세요.</p>
+            <div className="flex gap-2">
+              <Input
+                placeholder="01012345678"
+                value={senderPhone}
+                onChange={(e) => { setSenderPhone(e.target.value); setPhoneSaved(false) }}
+                className="h-9 rounded-lg border-gray-200 text-[13px] font-mono flex-1"
+              />
+              <Button
+                onClick={handleSavePhone}
+                disabled={!senderPhone.trim() || savingPhone}
+                className="h-9 px-4 rounded-lg text-[13px] font-semibold bg-primary hover:bg-primary/90 shrink-0"
+              >
+                {savingPhone ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : phoneSaved ? <CheckCircle2 className="w-3.5 h-3.5" /> : '저장'}
+              </Button>
+            </div>
+          </div>
+
+          <button
+            type="button"
+            onClick={handleConnect}
+            disabled={connecting}
+            className="w-full text-[12px] text-gray-400 hover:text-gray-600 transition-colors py-1"
+          >
+            {connecting ? '재연동 중...' : '연동 재시도'}
+          </button>
         </div>
       )}
     </div>
   )
-}
-
-/** HMAC-SHA256 인증 헤더 (클라이언트에서 테스트용) */
-async function buildHmacAuth(apiKey: string, apiSecret: string): Promise<string> {
-  const date = new Date().toISOString()
-  const salt = Array.from(crypto.getRandomValues(new Uint8Array(32)))
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('')
-  const encoder = new TextEncoder()
-  const key = await crypto.subtle.importKey(
-    'raw',
-    encoder.encode(apiSecret),
-    { name: 'HMAC', hash: 'SHA-256' },
-    false,
-    ['sign']
-  )
-  const sig = await crypto.subtle.sign('HMAC', key, encoder.encode(date + salt))
-  const hex = Array.from(new Uint8Array(sig))
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('')
-  return `HMAC-SHA256 ApiKey=${apiKey}, Date=${date}, salt=${salt}, Signature=${hex}`
 }

@@ -1,12 +1,10 @@
 import { createAdminClient } from '@/lib/supabase/admin'
-import { buildSmsMessages, buildAlimTalkMessages, buildFriendTalkMessages } from '@/lib/solapi'
-import { SolapiMessageService } from 'solapi'
+import { sendMessagesAsSubAccount, type SolapiMessage } from '@/lib/solapi-central'
 import { applyVariableBindings } from '@/lib/campaigns/variables'
 import type { Lead } from '@/types'
 
 interface SolapiConfig {
-  api_key: string
-  api_secret: string
+  account_id: string
   sender_phone: string
 }
 
@@ -315,14 +313,13 @@ async function loadSolapiConfig(workspaceId: string): Promise<SolapiConfig | nul
     .from('workspace_integrations')
     .select('config')
     .eq('workspace_id', workspaceId)
-    .eq('provider', 'solapi')
+    .eq('provider', 'solapi_sso')
     .single()
 
   const config = integration?.config as any
-  if (!config?.api_key || !config?.api_secret) return null
+  if (!config?.account_id) return null
   return {
-    api_key: config.api_key,
-    api_secret: config.api_secret,
+    account_id: config.account_id,
     sender_phone: config.sender_phone ?? '',
   }
 }
@@ -338,49 +335,37 @@ async function executeStepSend(
   lead: Lead
 ): Promise<{ success: boolean; error?: string }> {
   try {
-    const solapiClient = new SolapiMessageService(config.api_key, config.api_secret)
     const bindings = step.variable_bindings as Record<string, { type: 'field' | 'fixed'; value: string }> | null
-
-    // 변수 바인딩이 있으면 메시지 치환
     const messageContent = bindings && Object.keys(bindings).length > 0
       ? applyVariableBindings(step.message_content, bindings, lead)
       : step.message_content
 
     const kakaoOpts = step.kakao_options as any
+    const to = lead.phone.replace(/[^0-9]/g, '')
+    const from = config.sender_phone.replace(/[^0-9]/g, '')
 
-    let messageData
+    let message: SolapiMessage
     if (step.message_type === 'ALIMTALK' && step.template_id) {
-      messageData = buildAlimTalkMessages({
-        leads: [lead],
-        template: messageContent,
-        senderPhone: config.sender_phone,
-        pfId: kakaoOpts?.pf_id ?? '',
-        templateId: step.template_id,
-      })
+      message = { to, from, text: messageContent, kakaoOptions: { pfId: kakaoOpts?.pf_id ?? '', templateId: step.template_id } }
     } else if (step.message_type === 'FRIENDTALK' && kakaoOpts?.pf_id) {
-      messageData = buildFriendTalkMessages({
-        leads: [lead],
-        template: messageContent,
-        senderPhone: config.sender_phone,
-        pfId: kakaoOpts.pf_id,
-        imageId: kakaoOpts.image_id,
-        adFlag: kakaoOpts.ad_flag ?? false,
-      })
+      message = {
+        to, from,
+        kakaoOptions: {
+          pfId: kakaoOpts.pf_id,
+          messageType: kakaoOpts.image_id ? 'FI' : 'FT',
+          content: messageContent,
+          adFlag: kakaoOpts.ad_flag ?? false,
+          ...(kakaoOpts.image_id ? { imageId: kakaoOpts.image_id } : {}),
+        },
+      }
     } else {
-      messageData = buildSmsMessages({
-        leads: [lead],
-        template: messageContent,
-        senderPhone: config.sender_phone,
-      })
+      message = { to, from, text: messageContent }
     }
 
-    const result = await solapiClient.send(messageData.messages as any)
-    const failedList = result.failedMessageList ?? []
-
-    if (failedList.length > 0) {
-      return { success: false, error: (failedList[0] as any)?.reason ?? '발송 실패' }
+    const result = await sendMessagesAsSubAccount(config.account_id, [message])
+    if (result.failedList.length > 0) {
+      return { success: false, error: result.failedList[0].reason ?? '발송 실패' }
     }
-
     return { success: true }
   } catch (err: any) {
     return { success: false, error: err.message ?? '발송 중 오류 발생' }

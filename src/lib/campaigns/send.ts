@@ -1,6 +1,6 @@
 import { createAdminClient } from '@/lib/supabase/admin'
-import { SolapiMessageService } from 'solapi'
-import { buildSmsMessages, buildAlimTalkMessages, buildFriendTalkMessages } from '@/lib/solapi'
+import { sendMessagesAsSubAccount, type SolapiMessage } from '@/lib/solapi-central'
+import { buildReplacements } from '@/lib/campaigns/variables'
 import type { Lead } from '@/types'
 
 const BATCH_SIZE = 10000
@@ -28,21 +28,21 @@ export async function executeCampaignSend(campaignId: string) {
     throw new Error('발송 가능한 상태가 아닙니다.')
   }
 
-  // 2. 사용자의 Solapi API 키 조회
+  // 2. SSO 연동 정보 조회 (accountId + sender_phone)
   const { data: integration } = await supabase
     .from('workspace_integrations')
     .select('config')
     .eq('workspace_id', campaign.workspace_id)
-    .eq('provider', 'solapi')
+    .eq('provider', 'solapi_sso')
     .single()
 
   const config = integration?.config as any
-  if (!config?.api_key || !config?.api_secret) {
-    throw new Error('발송 서비스 연동이 필요합니다. 설정에서 API 키를 등록해 주세요.')
+  if (!config?.account_id) {
+    throw new Error('발송 서비스 연동이 필요합니다. 설정 → 발송 설정에서 연동해 주세요.')
   }
 
-  // 발신번호는 사용자가 Solapi에서 직접 등록한 번호 사용
-  const senderPhone = config.sender_phone ?? ''
+  const accountId: string = config.account_id
+  const senderPhone: string = config.sender_phone ?? ''
 
   // 3. 대상 리드 조회
   const filter = campaign.target_filter as any
@@ -118,55 +118,25 @@ export async function executeCampaignSend(campaignId: string) {
     .update({ status: 'sending', total_count: leads.length })
     .eq('id', campaignId)
 
-  // 5. 사용자의 Solapi 클라이언트
-  const solapiClient = new SolapiMessageService(config.api_key, config.api_secret)
-
   let successCount = 0
   let failCount = 0
 
-  // 7. 배치 발송
+  // 5. 배치 발송
   for (let i = 0; i < leads.length; i += BATCH_SIZE) {
-    const batch = leads.slice(i, i + BATCH_SIZE)
+    const batch = leads.slice(i, i + BATCH_SIZE) as Lead[]
 
     try {
       const kakaoOpts = campaign.kakao_options as any
+      const messages = buildCampaignMessages(batch, campaign.message_content, senderPhone, msgType, kakaoOpts)
 
-      let messageData
-      if (msgType === 'ATA' && kakaoOpts?.pf_id && kakaoOpts?.template_id) {
-        messageData = buildAlimTalkMessages({
-          leads: batch,
-          template: campaign.message_content,
-          senderPhone,
-          pfId: kakaoOpts.pf_id,
-          templateId: kakaoOpts.template_id,
-        })
-      } else if (msgType === 'FT' && kakaoOpts?.pf_id) {
-        messageData = buildFriendTalkMessages({
-          leads: batch,
-          template: campaign.message_content,
-          senderPhone,
-          pfId: kakaoOpts.pf_id,
-          adFlag: kakaoOpts.ad_flag ?? false,
-        })
-      } else {
-        messageData = buildSmsMessages({
-          leads: batch,
-          template: campaign.message_content,
-          senderPhone,
-        })
-      }
-
-      const result = await solapiClient.send(messageData.messages as any)
-      const failedIds = new Set(
-        (result.failedMessageList ?? []).map((f: any) => f.to)
-      )
+      const result = await sendMessagesAsSubAccount(accountId, messages)
+      const failedPhones = new Set(result.failedList.map((f) => f.to))
 
       const logs = batch.map((lead) => {
         const phone = lead.phone.replace(/[^0-9]/g, '')
-        const isFailed = failedIds.has(phone)
+        const isFailed = failedPhones.has(phone)
         if (isFailed) failCount++
         else successCount++
-
         return {
           workspace_id: campaign.workspace_id,
           campaign_id: campaignId,
@@ -208,4 +178,34 @@ export async function executeCampaignSend(campaignId: string) {
     .eq('id', campaignId)
 
   return { successCount, failCount, total: leads.length }
+}
+
+function buildCampaignMessages(
+  leads: Lead[],
+  template: string,
+  senderPhone: string,
+  msgType: string,
+  kakaoOpts: any
+): SolapiMessage[] {
+  const from = senderPhone.replace(/[^0-9]/g, '')
+  return leads.map((lead) => {
+    const to = lead.phone.replace(/[^0-9]/g, '')
+    const text = template
+    if (msgType === 'ATA' && kakaoOpts?.pf_id && kakaoOpts?.template_id) {
+      return { to, from, text, kakaoOptions: { pfId: kakaoOpts.pf_id, templateId: kakaoOpts.template_id } }
+    }
+    if (msgType === 'FT' && kakaoOpts?.pf_id) {
+      return {
+        to, from,
+        kakaoOptions: {
+          pfId: kakaoOpts.pf_id,
+          messageType: kakaoOpts.image_id ? 'FI' : 'FT',
+          content: text,
+          adFlag: kakaoOpts.ad_flag ?? false,
+          ...(kakaoOpts.image_id ? { imageId: kakaoOpts.image_id } : {}),
+        },
+      }
+    }
+    return { to, from, text }
+  })
 }

@@ -83,13 +83,35 @@ export async function getSSOToken(workspaceId: string) {
 }
 
 /**
- * Solapi 마이사이트 자동 로그인 URL 생성
- * 사용자가 이 URL로 이동하면 Solapi에 자동 로그인되어 해당 페이지로 감
+ * SSO 일회성 코드 생성
+ * ssoToken(영구)을 이용해 connect-homepage 리디렉션용 일회성 ssoCode를 발급
  */
-export function buildSolapiPageUrl(ssoToken: string, page: keyof typeof SOLAPI_PAGES) {
+export async function getSSOCode(ssoToken: string): Promise<string | null> {
+  const res = await fetch(`${BASE_URL}/appstore/v2/sso/code`, {
+    headers: {
+      Authorization: `sso ${ssoToken}`,
+    },
+  })
+  const text = await res.text()
+  console.log('[getSSOCode] status:', res.status, 'body:', text)
+  if (!res.ok) return null
+  try {
+    const data = JSON.parse(text)
+    return (data.ssoCode ?? data.code ?? data.token ?? null) as string | null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Solapi 마이사이트 자동 로그인 URL 생성
+ * ssoCode(일회성)를 받아 해당 마이사이트 페이지로 자동 로그인 URL 생성
+ */
+export function buildSolapiPageUrl(ssoCode: string, page: keyof typeof SOLAPI_PAGES) {
+  const MYSITE_URL = process.env.NEXT_PUBLIC_SOLAPI_MYSITE_URL ?? 'https://pixelpage.solapi.com'
   const path = SOLAPI_PAGES[page]
-  const redirectUri = encodeURIComponent(`https://solapi.com${path}`)
-  return `${BASE_URL}/appstore/v2/sso/connect-homepage?ssoCode=${ssoToken}&redirectUri=${redirectUri}`
+  const redirectUri = encodeURIComponent(path)
+  return `${MYSITE_URL}/api/appstore/v2/connect-homepage?ssoCode=${ssoCode}&redirectUri=${redirectUri}`
 }
 
 /** Solapi 콘솔 주요 페이지 */
@@ -101,15 +123,54 @@ export const SOLAPI_PAGES = {
   대시보드: '/dashboard',
 } as const
 
-// ─── 사용자 Solapi 계정 정보 조회 ───
+// ─── 서브계정 발송 ───
 
-/** 사용자의 잔액 조회 */
-export async function getUserBalance(ssoAccountId: string) {
-  // TODO: 사용자 계정의 잔액을 조회하는 방법 확인 필요
-  // 현재는 우리 계정 잔액만 조회 가능
-  const headers = buildAuthHeaders()
-  const res = await fetch(`${BASE_URL}/cash/v1/balance`, { headers })
-  if (!res.ok) return 0
+export interface SolapiMessage {
+  to: string
+  from: string
+  text?: string
+  kakaoOptions?: {
+    pfId: string
+    templateId?: string
+    messageType?: string
+    content?: string
+    adFlag?: boolean
+    imageId?: string
+    buttons?: { buttonType: string; buttonName: string; linkMo?: string; linkPc?: string }[]
+  }
+}
+
+/**
+ * 중앙 API키로 서브계정(accountId) 대신 메시지 발송
+ * Solapi REST API POST /messages/v4/send-many/detail
+ * X-Sub-Account-Id 헤더로 서브계정 지정 → 해당 계정 잔액 차감
+ */
+export async function sendMessagesAsSubAccount(
+  accountId: string,
+  messages: SolapiMessage[]
+): Promise<{ successCount: number; failedList: { to: string; reason?: string }[] }> {
+  const headers = {
+    ...buildAuthHeaders(),
+    'X-Sub-Account-Id': accountId,
+  }
+
+  const res = await fetch(`${BASE_URL}/messages/v4/send-many/detail`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ messages }),
+  })
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.errorMessage ?? `발송 실패: ${res.status}`)
+  }
+
   const data = await res.json()
-  return data.balance ?? 0
+  const failedList = (data.failedMessageList ?? []).map((f: any) => ({
+    to: f.to,
+    reason: f.reason ?? f.errorCode,
+  }))
+  const successCount = (messages.length) - failedList.length
+
+  return { successCount, failedList }
 }
